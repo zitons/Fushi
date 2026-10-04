@@ -152,6 +152,25 @@ jobs:
         chmod +x ci/apply-patches.sh
         bash ci/apply-patches.sh
 
+    # Ad-hoc installable build for this PR. Android requires every APK to be
+    # signed; the debug variant uses the Android SDK's automatically generated
+    # debug keystore, so no repository signing secret is needed.
+    - name: Build arm64 debug APK (automatic debug signing)
+      if: github.event_name == 'pull_request'
+      working-directory: fushi
+      run: >-
+        flutter build apk --debug --target-platform android-arm64
+        --build-number "$RELEASE_SEQUENCE"
+
+    - name: Upload arm64 debug APK
+      if: github.event_name == 'pull_request'
+      uses: actions/upload-artifact@v7
+      with:
+        name: fushi-android-arm64-debug-${{ github.event.pull_request.head.sha }}
+        path: fushi/build/app/outputs/flutter-apk/*-debug.apk
+        if-no-files-found: error
+        retention-days: 14
+
     - name: Run dart analyze
       working-directory: fushi
       run: flutter analyze
