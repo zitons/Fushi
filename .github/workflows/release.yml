@@ -227,10 +227,10 @@ jobs:
               debug)
                 TAG="${TAG:-v${VERSION}-debug.${RELEASE_SEQUENCE}+${SHORT_SHA}}"
                 NAME="${NAME:-Fushi debug ${VERSION} (${SHORT_SHA})}"
-                BODY="Manual debug build from ${GITHUB_REF_NAME} @ ${SHORT_SHA}. Debug releases are prerelease and never Latest."
-                BUILD_DEBUG_APK=true
-                BUILD_DEBUG_CHANNEL_APK=false
-                NEEDS_RELEASE_KEYSTORE=false
+                BODY="Manual release-signed debug-channel build from ${GITHUB_REF_NAME} @ ${SHORT_SHA}. Debug releases are prerelease and never Latest."
+                BUILD_DEBUG_APK=false
+                BUILD_DEBUG_CHANNEL_APK=true
+                NEEDS_RELEASE_KEYSTORE=true
                 ;;
               beta)
                 TAG="${TAG:-v${VERSION}-beta.${RELEASE_SEQUENCE}}"
