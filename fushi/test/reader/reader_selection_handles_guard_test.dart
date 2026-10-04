@@ -28,13 +28,29 @@ void main() {
   final String js = ReaderSelectionScripts.source();
 
   group('① 长按即选：无需额外拖动', () {
-    test('beginRangeSelection 建锚后立刻建立并绘制单字选区', () {
+    test('beginRangeSelection 建锚后立刻建立并绘制锚点选区', () {
       final String body = _between(
         js,
         'beginRangeSelection: function',
         'updateRangeSelection: function',
       );
       expect(body, contains('this.dragAnchor ='));
+      // 锚点是**区间**：空格分词词里长按 -> 整词锚点（原地长按即选中整词），其它脚本 -> 单字。
+      expect(
+        body,
+        contains('this.selectionAnchorAtHit(hit)'),
+        reason: '锚点区间必须由 selectionAnchorAtHit 解析（词/字两种粒度）',
+      );
+      expect(
+        body,
+        contains('endNode: anchor.endNode'),
+        reason: '锚点必须记下区间末端，反向拖动才不会丢词尾',
+      );
+      expect(
+        body,
+        contains('this.wordSelectMode = true'),
+        reason: '长按拖选 = 单词选择模式（端点吸附词边界，CJK 自动字符级）',
+      );
       expect(
         body,
         contains('this.updateRangeSelection(x, y);'),
@@ -42,7 +58,7 @@ void main() {
       );
     });
 
-    test('updateRangeSelection 继续按当前命中字扩展选区', () {
+    test('updateRangeSelection 继续按当前命中字/坐标扩展选区', () {
       final String body = _between(
         js,
         'updateRangeSelection: function',
@@ -51,8 +67,18 @@ void main() {
       // BUG-长按选择不灵敏：扩选走**选择**命中（不剔除标点/空白），不是查词命中——
       // 拖过句号时查词命中返回 null 会让选区停住。
       expect(body, contains('this.getSelectableCharacterAtPoint(x, y)'));
+      expect(
+        body,
+        contains('this.resolveSelectionEndpoint(x, y'),
+        reason:
+            '本次修复：严格命中落空（字缝/行距/行尾/行首）时必须回退到「坐标 -> 文本位置」'
+            '解析，否则端点被钉回锚点、选区当场塌回锚点字（用户报的手柄卡住）',
+      );
       expect(body, contains('this.collectRangeBetween('));
       expect(body, contains('this.renderSelectionHighlight();'));
+      // 锚点是区间：正向取 anchor.node/offset、反向取 anchor.endNode/endOffset。
+      expect(body, contains('anchor.endNode'));
+      expect(body, contains('anchor.endOffset'));
     });
 
     test('endRangeSelection 对原地与拖动长按都停在选区状态弹菜单', () {
@@ -148,6 +174,21 @@ void main() {
       );
       expect(body, contains('this.renderSelectionHighlight();'));
       expect(body, contains('this.positionSelectionHandles();'));
+      // 本次修复：严格命中落空时必须走「坐标 -> 文本位置」解析，不得直接 return 冻结手柄。
+      expect(
+        body,
+        contains('this.resolveSelectionEndpoint(x, y, hit, anchorNode, anchorOffset)'),
+        reason: '拖手柄到字缝/行尾空白时必须仍然解析出端点（否则手柄视觉冻结）',
+      );
+      expect(
+        body,
+        contains('if (!endpoint) return;'),
+        reason: '只有解析失败才允许保持旧端点（不收缩、不塌陷）',
+      );
+      final int resolveAt = body.indexOf('this.resolveSelectionEndpoint(');
+      final int nullGuardAt = body.indexOf('if (!endpoint) return;');
+      expect(resolveAt, greaterThanOrEqualTo(0));
+      expect(nullGuardAt, greaterThan(resolveAt), reason: '空值守卫必须在解析之后');
     });
 
     test('BUG-765：拖手柄 hit-test 时临时熄灭手柄 pointer-events（防命中手柄自身冻结）', () {
