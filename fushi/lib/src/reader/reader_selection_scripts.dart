@@ -379,14 +379,7 @@ window.__fushiCssHighlightsSupported = !!(window.CSS && CSS.highlights && window
 window.fushiSelection = {
   selection: null,
   // TODO-1317: mobile long-press selection anchor.
-  // 本次修复把它扩成**区间**：{node, offset, endNode, endOffset}，空格分词词里长按定下的
-  // 是整词（词首..词末），其它脚本是单字（首尾同一位置）。见 selectionAnchorAtHit。
   dragAnchor: null,
-  // 本次修复：移动端长按拖选的「单词选择模式」。true 时端点吸附到空格分词词的边界
-  // （Android 原生手柄拖动的 WordIterator 语义），CJK 等无空格分词脚本自动保持字符级。
-  // 只由 beginRangeSelection（长按）置位、clearSelection 复位 —— 桌面鼠标走浏览器原生
-  // 选区、单击查词走 selectText，都不经过这里。
-  wordSelectMode: false,
   // TODO-1366: start/end drag handles (touch grips) for the app-drawn selection.
   // Elements are lazily created and parented to <html> (like the caret ring),
   // shown only while a drag-selection is live and adjustable, hidden on clear.
@@ -721,261 +714,6 @@ window.fushiSelection = {
       }
     }
     return null;
-  },
-  // ---- 坐标 -> 文本位置（选区拖动端点解析层） --------------------------------
-  //
-  // 根因（用户报「长按拖选 / 拖手柄到字缝、行尾、段间空白，手柄就卡住、松手再拖也过不
-  // 去」）：拖动路径原来**只**认几何命中 `getSelectableCharacterAtPoint`——它要求手指压
-  // 在某个字符矩形上（先精确、再 ±6px）。字缝、行距、行尾/行首空白（text-indent、两端
-  // 对齐的伸缩空隙、段间 margin）上没有任何字符矩形盖住手指，命中返回 null；于是
-  // `updateRangeSelection` 把端点钉回锚点（整段选区当场塌回锚点字）、`moveSelectionHandle`
-  // 直接 return（手柄视觉冻结）。修法不是把 ±6px 调大——那只是把卡住的位置推迟到下一个
-  // 缝隙。这里补一层真正的「坐标 -> 文本位置」解析，语义与 Android
-  // `TextView.getOffsetForPosition()` / Flutter `TextPainter.getPositionForOffset()` 一致：
-  //
-  //   手指坐标 -> 最近 caret（字符之间的位置）-> 方向修正 -> 端点字符 -> collectRangeBetween
-  //
-  // 三级解析（每级都过 BUG-1797 的可见性收口：分页页边距带里被 clip 掉的相邻页字符永不
-  // 参与竞争，否则手柄会被拉到看不见的另一页文字上）：
-  //   ① 原生 caret API（`caretPositionFromPoint` / `caretRangeFromPoint`）：Chrome WebView
-  //      与 WKWebView 都实现了「最近 caret」语义（落在行距/字缝/行尾会按最近行盒 clamp），
-  //      O(1)，绝大多数帧走这条。只认文本节点结果（BUG-765：手柄 div / documentElement
-  //      的命中不可信），并复核相邻字符可见。
-  //   ② 原生不可用 / 命中被遮挡 / 结果不可见时，在命中元素所在的**文本块**里逐字符几何
-  //      扫描：交叉轴（横排 = y，竖排 = x）先定行，行内轴再按字符矩形中点规则定 caret
-  //      （与 `Layout.getOffsetForHorizontal` 同判据）。扫描有界于块、有字符数上限。
-  //   ③ 都失败 -> null。调用方保持旧端点（不收缩、不清高亮），旧路径零回归。
-  //
-  // 字符 (node, offset) 的 Range（按码点算 1~2 个 UTF-16 单元）。越界 / 非文本节点返回 null。
-  charRangeAt: function(node, offset) {
-    if (!node || node.nodeType !== Node.TEXT_NODE) return null;
-    var text = node.textContent || '';
-    if (offset < 0 || offset >= text.length) return null;
-    var codePoint = text.codePointAt(offset);
-    var length = (codePoint !== undefined && codePoint > 0xffff) ? 2 : 1;
-    var range = document.createRange();
-    range.setStart(node, offset);
-    range.setEnd(node, Math.min(offset + length, text.length));
-    return range;
-  },
-  // 字符矩形的交叉轴 / 行内轴区间（横排：交叉轴 = y、行内轴 = x；竖排 vertical-rl：
-  // 交叉轴 = x、行内轴 = y）。阅读方向（列内从上到下 / 行内从左到右）与偏移增长方向
-  // 一致，故中点规则两个轴向共用一套判据。
-  charAxisBounds: function(rect, vertical) {
-    return {
-      crossLo: vertical ? rect.left : rect.top,
-      crossHi: vertical ? rect.right : rect.bottom,
-      inlineLo: vertical ? rect.top : rect.left,
-      inlineHi: vertical ? rect.bottom : rect.right,
-    };
-  },
-  // 两个文本位置 (node, offset) 的文档序：-1 在前 / 0 同一位置 / 1 在后。判据与
-  // collectRangeBetween 的端点排序同源（compareDocumentPosition）。
-  compareTextPosition: function(nodeA, offsetA, nodeB, offsetB) {
-    if (nodeA === nodeB) return offsetA < offsetB ? -1 : (offsetA > offsetB ? 1 : 0);
-    if (!nodeA || !nodeB) return 0;
-    return (nodeA.compareDocumentPosition(nodeB) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1;
-  },
-  // 空格分词词的边界 [start, end)（`isSpaceDelimitedLetter` + 词内撇号，与扫描模型同一套
-  // 真值）。`index` 处的字符不属于这样的词（CJK / 标点 / 空白）时返回 null。
-  spaceDelimitedWordBounds: function(text, index) {
-    if (!text || index < 0 || index >= text.length) return null;
-    if (!this.isSpaceDelimitedLetter(text[index])) return null;
-    var start = index;
-    var end = index + 1;
-    while (start > 0 &&
-        (this.isSpaceDelimitedLetter(text[start - 1]) || this.isIntraWordApostrophe(text, start - 1))) {
-      start--;
-    }
-    while (end < text.length &&
-        (this.isSpaceDelimitedLetter(text[end]) || this.isIntraWordApostrophe(text, end))) {
-      end++;
-    }
-    return { start: start, end: end };
-  },
-  // 端点吸附：单词选择模式（移动端长按拖选）下把端点字符吸附到它所在空格分词词的边界
-  // ——正向取词末字符、反向取词首字符，与 Android 原生手柄拖动的 WordIterator 同语义
-  // （长按选中的是词、拖手柄也按词进退）。CJK 等无空格分词脚本不在这样的词里，原样返回
-  // -> 保持字符级（词典引擎按字符扫描，字符级才是它要的粒度）。
-  snapEndpointToWord: function(endpoint, forward) {
-    if (!this.wordSelectMode || !endpoint || !endpoint.node) return endpoint;
-    var bounds = this.spaceDelimitedWordBounds(endpoint.node.textContent, endpoint.offset);
-    if (!bounds) return endpoint;
-    return { node: endpoint.node, offset: forward ? bounds.end - 1 : bounds.start };
-  },
-  // 端点规范化：collectRangeBetween 的游走用 createWalker（REJECT 纯空白节点与振假名），
-  // 端点若落在被跳过的节点里，游走永远匹配不到 endNode —— 会一路扫到文末、选区暴涨。故先把
-  // 端点挪到游走会访问的正文节点：正向顺延到下一个正文节点的首字，反向回退到上一个正文
-  // 节点的末字；两个方向都没有正文时返回 null（调用方保持旧端点）。
-  normalizeEndpoint: function(node, offset, forward) {
-    if (!node || node.nodeType !== Node.TEXT_NODE) return null;
-    var text = node.textContent || '';
-    var walkable = text.length > 0 && !this.isFurigana(node) && !/^[\s　]*$/.test(text);
-    if (walkable) return { node: node, offset: Math.min(offset, text.length - 1) };
-    var walker = this.createWalker(document.body);
-    walker.currentNode = node;
-    if (forward) {
-      var next = walker.nextNode();
-      while (next) {
-        if (next.textContent.length > 0) return { node: next, offset: 0 };
-        next = walker.nextNode();
-      }
-    }
-    var back = this.createWalker(document.body);
-    back.currentNode = node;
-    var prev = back.previousNode();
-    while (prev) {
-      if (prev.textContent.length > 0) return { node: prev, offset: prev.textContent.length - 1 };
-      prev = back.previousNode();
-    }
-    return null;
-  },
-  // caret (node, offset) 相邻字符里有没有可见的（BUG-1797 可见性收口）。相邻 = caret 左右
-  // 各一个字；都不在（节点首尾 / 都不可见）时返回 false，交给几何兜底再试。
-  caretHasVisibleNeighbour: function(node, offset, box) {
-    var offsets = [offset - 1, offset];
-    for (var i = 0; i < offsets.length; i++) {
-      var range = this.charRangeAt(node, offsets[i]);
-      if (!range) continue;
-      if (this.charRangeVisible(range, box)) return true;
-    }
-    return false;
-  },
-  // ① 原生 caret 快路。返回 {node, offset}（caret 语义，offset ∈ [0, len]）或 null。
-  nativeCaretAtPoint: function(x, y, box) {
-    var node = null;
-    var offset = 0;
-    try {
-      if (document.caretPositionFromPoint) {
-        var pos = document.caretPositionFromPoint(x, y);
-        if (pos && pos.offsetNode && pos.offsetNode.nodeType === Node.TEXT_NODE) {
-          node = pos.offsetNode;
-          offset = pos.offset;
-        }
-      } else if (document.caretRangeFromPoint) {
-        var range = document.caretRangeFromPoint(x, y);
-        if (range && range.startContainer &&
-            range.startContainer.nodeType === Node.TEXT_NODE) {
-          node = range.startContainer;
-          offset = range.startOffset;
-        }
-      }
-    } catch (err) {
-      return null;
-    }
-    if (!node || this.isFurigana(node)) return null;
-    if (!this.caretHasVisibleNeighbour(node, offset, box)) return null;
-    return { node: node, offset: offset };
-  },
-  // ② 几何兜底：在命中元素所在的文本块里逐字符扫描，按「交叉轴最近 -> 行内轴最近」定
-  // caret。交叉轴优先是关键：行距/段距里的点必须先归到最近的**行**，否则拖到行尾右侧时
-  // 下一行的字在内联轴上贴着手指、交叉轴只差一个行距，端点会跳行。行内轴按字符矩形的
-  // 中点规则取前沿/后沿：落在字符前的空隙取前沿、字符后的空隙取后沿 -> 行尾右侧空白
-  // clamp 到行尾（最后一个字被包含）、行首左侧空白 clamp 到行首。
-  // 有界：根 = 命中元素所在的块（绝不落到整个 body），并且有字符数上限。
-  geometricCaretAtPoint: function(x, y, box) {
-    var el = document.elementFromPoint(x, y);
-    if (!el) return null;
-    var container = (el.closest && el.closest('p, div, span, ruby, a')) || document.body;
-    if (!container) return null;
-    var vertical = this._selectionVertical();
-    var inlineCoord = vertical ? y : x;
-    var crossCoord = vertical ? x : y;
-    var walker = this.createWalker(container);
-    var best = null;
-    var scanned = 0;
-    var node;
-    while ((node = walker.nextNode()) && scanned < 4000) {
-      var text = node.textContent || '';
-      for (var i = 0; i < text.length && scanned < 4000;) {
-        var codePoint = text.codePointAt(i);
-        var charLength = (codePoint !== undefined && codePoint > 0xffff) ? 2 : 1;
-        var charRange = this.charRangeAt(node, i);
-        scanned++;
-        if (charRange && this.charRangeVisible(charRange, box)) {
-          var rects = charRange.getClientRects();
-          for (var r = 0; r < rects.length; r++) {
-            var rect = rects[r];
-            if (!rect || !(rect.width > 0) || !(rect.height > 0)) continue;
-            var bounds = this.charAxisBounds(rect, vertical);
-            var crossDist = crossCoord < bounds.crossLo ? bounds.crossLo - crossCoord
-              : (crossCoord > bounds.crossHi ? crossCoord - bounds.crossHi : 0);
-            var inlineDist = inlineCoord < bounds.inlineLo ? bounds.inlineLo - inlineCoord
-              : (inlineCoord > bounds.inlineHi ? inlineCoord - bounds.inlineHi : 0);
-            if (best && (crossDist > best.crossDist ||
-                (crossDist === best.crossDist && inlineDist >= best.inlineDist))) continue;
-            // 中点规则：点越过字符中线（或已在其后沿之外）-> 取后沿（下一个字符的前面 /
-            // 行尾）；否则取前沿。
-            var afterGlyph = inlineCoord > bounds.inlineHi ||
-              (inlineCoord >= bounds.inlineLo &&
-               inlineCoord >= (bounds.inlineLo + bounds.inlineHi) / 2);
-            best = {
-              node: node,
-              offset: afterGlyph ? i + charLength : i,
-              crossDist: crossDist,
-              inlineDist: inlineDist
-            };
-          }
-        }
-        i += charLength;
-      }
-    }
-    return best ? { node: best.node, offset: best.offset } : null;
-  },
-  // 坐标 -> caret：原生快路 -> 几何兜底 -> null。[box] 由调用方复用（一次拖动只在需要时量
-  // 一次几何）；不传时自己算一份。
-  caretPositionAtPoint: function(x, y, box) {
-    if (box === undefined) box = this.visibleContentBox();
-    var native = this.nativeCaretAtPoint(x, y, box);
-    if (native) return native;
-    return this.geometricCaretAtPoint(x, y, box);
-  },
-  // 拖动入口的端点解析（唯一出口）：
-  //   [strictHit] 严格几何命中的字符（getSelectableCharacterAtPoint 的结果，可为 null）；
-  //   (refNode, refOffset) 定锚端，用来判定这次拖动是向锚点之后扩（forward）还是之前缩。
-  // 返回 {node, offset, forward}，或 null（解析失败 -> 调用方保持旧选区，绝不收缩）。
-  // 严格命中优先 = 旧行为零回归（手指压在字符矩形上时端点就是那个字）；只有严格命中落空
-  // （字缝 / 行距 / 行尾 / 行首等没有字符矩形盖住手指的点）才走「坐标 -> 文本位置」解析。
-  resolveSelectionEndpoint: function(x, y, strictHit, refNode, refOffset) {
-    var node = null;
-    var offset = 0;
-    var forward = true;
-    if (strictHit) {
-      node = strictHit.node;
-      offset = strictHit.offset;
-      forward = this.compareTextPosition(node, offset, refNode, refOffset) >= 0;
-    } else {
-      var box = this.visibleContentBox();
-      var caret = this.caretPositionAtPoint(x, y, box);
-      if (!caret) return null;
-      forward = this.compareTextPosition(caret.node, caret.offset, refNode, refOffset) > 0;
-      // caret 是**字符之间**的位置：正向（往锚点之后拖）取 caret 前一个字符，反向取 caret
-      // 所在字符 —— 与 collectRangeBetween「端点字符计入区间」的语义配套。
-      var neighbour = forward
-        ? this.charBefore(caret.node, caret.offset)
-        : this.charAt(caret.node, caret.offset);
-      if (!neighbour || !neighbour.node) return null;
-      node = neighbour.node;
-      offset = neighbour.offset;
-      // BUG-1797：端点必须是**可见**字符。分页页边距带里被 clip 掉的相邻页字符可以被
-      // clamp 命中（布局期几何仍在），但用户看不见它 —— 那种点解析不出端点，保持旧端点，
-      // 绝不把选区拉到看不见的另一页文字上。
-      var endpointRange = this.charRangeAt(node, offset);
-      if (!endpointRange || !this.charRangeVisible(endpointRange, box)) return null;
-    }
-    var endpoint = this.normalizeEndpoint(node, offset, forward) ||
-      { node: node, offset: offset };
-    if (this.wordSelectMode) endpoint = this.snapEndpointToWord(endpoint, forward);
-    return { node: endpoint.node, offset: endpoint.offset, forward: forward };
-  },
-  // 长按定锚的锚点区间：空格分词词里长按 -> 整词锚点（词首..词末），原地长按即选中整词、
-  // 向两侧拖动都不丢词尾；CJK / 标点 / 空白 -> 单字锚点（与 BUG-609 起的老行为一致）。
-  selectionAnchorAtHit: function(hit) {
-    var bounds = this.spaceDelimitedWordBounds(hit.node.textContent, hit.offset);
-    if (!bounds) {
-      return { node: hit.node, offset: hit.offset, endNode: hit.node, endOffset: hit.offset };
-    }
-    return { node: hit.node, offset: bounds.start, endNode: hit.node, endOffset: bounds.end - 1 };
   },
   getSentenceContext: function(startNode, startOffset) {
     var container = this.findParagraph(startNode) || document.body;
@@ -1761,16 +1499,7 @@ window.fushiSelection = {
     var hit = this.getSelectableCharacterAtPoint(x, y);
     if (!hit) return false;
     this.clearSelection();
-    // 锚点区间：空格分词词里长按定的是整词（原地长按即选中整词 —— Android 长按的语义），
-    // CJK / 标点 / 空白定的是单字（与 BUG-609 起的老行为一致）。
-    var anchor = this.selectionAnchorAtHit(hit);
-    this.dragAnchor = {
-      node: anchor.node, offset: anchor.offset,
-      endNode: anchor.endNode, endOffset: anchor.endOffset
-    };
-    // 移动端长按拖选 = 单词选择模式：端点吸附到空格分词词边界（见 snapEndpointToWord）；
-    // CJK 不在这样的词里，自动保持字符级。
-    this.wordSelectMode = true;
+    this.dragAnchor = { node: hit.node, offset: hit.offset };
     // Establish and paint the anchor glyph immediately. This is the feedback the
     // native Android selection path gives at long-press time; the old path only
     // armed an anchor and made selection contingent on a later drag.
@@ -1779,32 +1508,12 @@ window.fushiSelection = {
   },
   updateRangeSelection: function(x, y) {
     if (!this.dragAnchor) return null;
-    var anchor = this.dragAnchor;
     var hit = this.getSelectableCharacterAtPoint(x, y);
-    var endpoint = null;
-    if (hit) {
-      // 手指压在字符矩形上：落在锚点区间（长按定下的字 / 词）内 -> 保持锚点选区不收缩；
-      // 落在锚点之后 -> 正向端点；落在锚点之前 -> 反向端点。
-      if (this.compareTextPosition(hit.node, hit.offset, anchor.endNode, anchor.endOffset) > 0 ||
-          this.compareTextPosition(hit.node, hit.offset, anchor.node, anchor.offset) < 0) {
-        endpoint = this.resolveSelectionEndpoint(x, y, hit, anchor.node, anchor.offset);
-      }
-    } else {
-      // 字缝 / 行距 / 行尾 / 行首等没有字符矩形盖住手指的点：回退到「坐标 -> 文本位置」
-      // 解析（Android TextView.getOffsetForPosition 语义），端点才能连续跟随手指。
-      // 旧实现在这里把端点钉回锚点（整段选区当场塌回锚点字）—— 那正是用户报的
-      // 「拖到空白/行尾手柄就卡住」。
-      endpoint = this.resolveSelectionEndpoint(x, y, null, anchor.node, anchor.offset);
-    }
-    var built;
-    if (endpoint) {
-      built = endpoint.forward
-        ? this.collectRangeBetween(anchor.node, anchor.offset, endpoint.node, endpoint.offset)
-        : this.collectRangeBetween(endpoint.node, endpoint.offset, anchor.endNode, anchor.endOffset);
-    } else {
-      // 解析失败 / 手指仍在锚点区间内：重建锚点选区（不收缩、不清高亮）。
-      built = this.collectRangeBetween(anchor.node, anchor.offset, anchor.endNode, anchor.endOffset);
-    }
+    // Over a gap/blank while dragging, keep the anchor as the end (no shrink).
+    var endNode = hit ? hit.node : this.dragAnchor.node;
+    var endOffset = hit ? hit.offset : this.dragAnchor.offset;
+    var built = this.collectRangeBetween(
+      this.dragAnchor.node, this.dragAnchor.offset, endNode, endOffset);
     if (!built) return null;
     this.selection = {
       startNode: built.startNode, startOffset: built.startOffset,
@@ -1956,13 +1665,6 @@ window.fushiSelection = {
   moveSelectionHandle: function(which, x, y) {
     var eps = this.selectionEndpoints();
     if (!eps) return;
-    // 定锚端（对侧端点）：拖 end 手柄时锚点是选区起点，拖 start 手柄时锚点是选区终点。
-    var anchorNode, anchorOffset;
-    if (which === 'end') {
-      anchorNode = eps.startNode; anchorOffset = eps.startOffset;
-    } else {
-      anchorNode = eps.endNode; anchorOffset = eps.endOffset;
-    }
     // The grip div sits directly under the finger (pointer-events:auto, top
     // z-index). A hit-test at the raw finger point resolves elementFromPoint /
     // caretPositionFromPoint to the grip element (an ELEMENT_NODE, not a text
@@ -1985,12 +1687,14 @@ window.fushiSelection = {
       handles.start.style.pointerEvents = savedStartPe || 'auto';
       handles.end.style.pointerEvents = savedEndPe || 'auto';
     }
-    // 字缝 / 行距 / 行尾/行首空白处严格命中为 null —— 回退到「坐标 -> 文本位置」解析
-    // （本次修复），端点才能连续跟随手指；旧实现在这里直接 return，手柄视觉冻结、松手
-    // 再拖也过不去那一段空白。
-    var endpoint = this.resolveSelectionEndpoint(x, y, hit, anchorNode, anchorOffset);
-    if (!endpoint) return;
-    var built = this.collectRangeBetween(anchorNode, anchorOffset, endpoint.node, endpoint.offset);
+    if (!hit) return;
+    var anchorNode, anchorOffset;
+    if (which === 'end') {
+      anchorNode = eps.startNode; anchorOffset = eps.startOffset;
+    } else {
+      anchorNode = eps.endNode; anchorOffset = eps.endOffset;
+    }
+    var built = this.collectRangeBetween(anchorNode, anchorOffset, hit.node, hit.offset);
     if (!built) return;
     this.selection = {
       startNode: built.startNode, startOffset: built.startOffset,
@@ -2222,9 +1926,6 @@ window.fushiSelection = {
     }
     this.hideSelectionHandles();
     this.selection = null;
-    // 锚点与单词选择模式都是「一次长按拖选」的会话状态：选区清掉就复位，下次长按重新建立。
-    this.dragAnchor = null;
-    this.wordSelectMode = false;
   }
 };
 """;
